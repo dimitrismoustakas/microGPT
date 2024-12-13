@@ -1,85 +1,77 @@
 import math
+import inspect
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class NewGELU(nn.Module):
-    def forward(self, x):
-        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
-
-# Define the AddPositionalEncoding class with standard sinusoidal encoding
-class AddPositionalEncoding(nn.Module):
-    def __init__(self, len_max):
-        super().__init__()
-        self.len_max = len_max
-
-    def forward(self, input):
-        # input shape: (batch_size, seq_length, dim_model)
-        batch_size, seq_length, dim_model = input.size()
-        position = torch.arange(seq_length, device=input.device).unsqueeze(1)  # (seq_length, 1)
-        div_term = torch.exp(torch.arange(0, dim_model, 2, device=input.device) * -(math.log(10000.0) / dim_model))
-        pe = torch.zeros(seq_length, dim_model, device=input.device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, seq_length, dim_model)
-        return input + pe
-
-# Define the QKVAttention class
+# QKVAttention class with optional causality
 class QKVAttention(nn.Module):
-    def __init__(self, dim_in, dim_qk, dim_v, n_heads=1, causal=False, dropout=0.0):
+    def __init__(self, n_embd, n_heads=1, block_size = 1024, dropout=0.0, use_bias = False, causal = False):
         super().__init__()
 
-        def randw(*d):
-            return nn.Parameter(torch.randn(*d) / math.sqrt(d[-1]))
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias = use_bias)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
 
-        self.causal = causal
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.n_head = n_heads
+        self.n_embd = n_embd
         self.dropout = dropout
+        self.causal = causal
 
-        self.w_q = randw(n_heads, dim_qk, dim_in)
-        self.w_k = randw(n_heads, dim_qk, dim_in)
-        self.w_v = randw(n_heads, dim_v, dim_in)
-        self.w_o = randw(dim_v * n_heads, dim_in)
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
-    def forward(self, input):
-        # input shape: (batch_size, seq_length, dim_in)
-        q = torch.einsum("ntc,hdc->nhtd", input, self.w_q)  # (batch_size, nb_heads, seq_length, dim_qk)
-        k = torch.einsum("ntc,hdc->nhtd", input, self.w_k)  # (batch_size, nb_heads, seq_length, dim_qk)
-        v = torch.einsum("ntc,hdc->nhtd", input, self.w_v)  # (batch_size, nb_heads, seq_length, dim_v)
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            if self.causal:
+                self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
+                                        .view(1, 1, block_size, block_size))
+            else:
+                self.register_buffer("bias", torch.ones(block_size, block_size)
+                                 .view(1, 1, block_size, block_size))
+            
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        a = torch.einsum("nhtd,nhsd->nhts", q, k) / math.sqrt(self.w_q.size(1))  # (batch_size, nb_heads, seq_length, seq_length)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        if self.causal:
-            t = torch.arange(input.size(1), device=q.device)
-            attzero = t[None, None, :, None] < t[None, None, None, :]
-            a = a.masked_fill(attzero, float("-inf"))
+        if self.flash:
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
+        else:
+            if self.causal:
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        a = a.softmax(dim=3)  # Softmax over the last dimension
-        a = F.dropout(a, self.dropout, self.training)
-        y = torch.einsum("nhts,nhsd->nthd", a, v).flatten(2)  # (batch_size, seq_length, nb_heads * dim_v)
-
+        y = self.resid_dropout(self.c_proj(y))
+        
         return y
 
-# Define the TransformerBlock class
+# TransformerBlock class
 class TransformerBlock(nn.Module):
-    def __init__(self, n_embd, dim_keys, dim_hidden, n_heads, causal, dropout):
+    def __init__(self, n_embd, n_heads, block_size, dropout, use_bias, causal):
         super().__init__()
-        self.att_ln = nn.LayerNorm(n_embd)
+        self.att_ln = nn.LayerNorm(n_embd, bias = use_bias)
         self.att_mh = QKVAttention(
-            dim_in=n_embd,
-            dim_qk=dim_keys,
-            dim_v=n_embd // n_heads,
+            n_embd=n_embd,
             n_heads=n_heads,
-            causal=causal,
+            block_size=block_size,
             dropout=dropout,
+            use_bias=use_bias,
+            causal=causal,
         )
-        self.ffn_ln = nn.LayerNorm(n_embd)
-        # self.ffn_fc1 = nn.Linear(in_features=dim_model, out_features=dim_hidden)
-        # self.ffn_fc2 = nn.Linear(in_features=dim_hidden, out_features=dim_model)
-        # self.gelu_activation = NewGELU()
+        self.ffn_ln = nn.LayerNorm(n_embd, bias = use_bias)
         self.mlp = nn.ModuleDict(dict(
-            ffn_fc1 = nn.Linear(n_embd, dim_hidden),
-            ffn_fc2 = nn.Linear(dim_hidden, n_embd),
-            act     = NewGELU(),
+            ffn_fc1 = nn.Linear(n_embd, 4*n_embd),
+            ffn_fc2 = nn.Linear(4*n_embd, n_embd),
+            act     = nn.GELU(),
             dropout = nn.Dropout(0.1)
         ))
         m = self.mlp
@@ -90,54 +82,104 @@ class TransformerBlock(nn.Module):
         x = x + self.mlpf(self.ffn_ln(x))
         return x
 
-# Define the PicoGPT model
+# PicoGPT model
 class PicoGPT(nn.Module):
     def __init__(
         self,
-        voc_size,
+        vocab_size,
         n_embd,
-        dim_keys,
-        dim_hidden,
         n_heads,
-        nb_blocks,
+        n_layer,
         causal,
         dropout=0.0,
-        len_max=1e5,
+        use_bias=False,
+        block_size=1e5,
+        
     ):
         super().__init__()
 
-        self.starter = nn.Sequential(
-            nn.Embedding(voc_size, n_embd, padding_idx=tokenizer.pad_token_id),
-            nn.Dropout(dropout),
-            AddPositionalEncoding(len_max),
-        )
+        assert vocab_size is not None
+        assert block_size is not None
+        
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(vocab_size, n_embd),
+            wpe = nn.Embedding(block_size, n_embd),
+            drop = nn.Dropout(dropout),
+            h = nn.ModuleList([TransformerBlock(n_embd, n_heads, block_size, dropout, use_bias, causal) for _ in range(n_layer)]),
+            ln_f = nn.LayerNorm(n_embd, bias=use_bias),
+        ))
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-        self.trunk = nn.Sequential(
-            *[
-                TransformerBlock(
-                    n_embd, dim_keys, dim_hidden, n_heads, causal, dropout
-                )
-                for _ in range(nb_blocks)
-            ]
-        )
+        self.transformer.wte.weight = self.lm_head.weight # Weight Tying paper
 
-        self.readout = nn.Linear(in_features=n_embd, out_features=voc_size)
+        # init all weights
+        self.apply(self._init_weights)
 
-        with torch.no_grad():
-            for m in self.modules():
-                if isinstance(m, nn.Embedding):
-                    m.weight.normal_(mean=0, std=2e-2)
-                elif isinstance(m, nn.LayerNorm):
-                    m.bias.zero_()
-                    m.weight.fill_(1.0)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * n_layer))
+
+        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+    
+    def get_num_params(self, non_embedding=False):
+        n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
+        return n_params
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.ones_(module.weight)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+
 
     def forward(self, input):
-        # input shape: (batch_size, seq_length)
-        x = self.starter(input)  # (batch_size, seq_length, dim_model)
-        x = self.trunk(x)        # (batch_size, seq_length, dim_model)
-        x = self.readout(x)      # (batch_size, seq_length, voc_size)
+        device = input.device
+        b, t = input.size()
+        assert t <= self.transformer.wpe.weight.size(0), f"Cannot forward sequence of length {t}, block size is only {self.transformer.wpe.weight.size(0)}"
+
+        tok_emb = self.transformer.wte(input)
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
+        pos_emb = self.transformer.wpe(pos)
+
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        x = self.lm_head(x)
+
         return x
 
     def cross_entropy(self, input):
         x = self(input)
         return F.cross_entropy(x.transpose(1, 2), input)
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # Any parameters that is 2D will be weight decayed, otherwise no.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused AdamW: {use_fused}")
+
+        return optimizer
