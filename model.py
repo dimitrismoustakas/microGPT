@@ -1,123 +1,153 @@
-import math
 import inspect
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from typing import Optional
+from dataclasses import dataclass
 
-# QKVAttention class with optional causality
-class QKVAttention(nn.Module):
-    def __init__(self, n_embd, n_heads=1, block_size = 1024, dropout=0.0, use_bias = False, causal = False):
-        super().__init__()
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias = use_bias)
-        self.c_proj = nn.Linear(n_embd, n_embd, bias=use_bias)
+class CastedLinear(nn.Linear):
 
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.n_head = n_heads
-        self.n_embd = n_embd
-        self.dropout = dropout
-        self.causal = causal
-
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            if self.causal:
-                self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
-                                        .view(1, 1, block_size, block_size))
-            else:
-                self.register_buffer("bias", torch.ones(block_size, block_size)
-                                 .view(1, 1, block_size, block_size))
-            
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=self.causal)
-        else:
-            if self.causal:
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        y = self.resid_dropout(self.c_proj(y))
-        
-        return y
-
-# TransformerBlock class
-class TransformerBlock(nn.Module):
-    def __init__(self, n_embd, n_heads, block_size, dropout, use_bias, causal):
-        super().__init__()
-        self.att_ln = nn.LayerNorm(n_embd, bias = use_bias)
-        self.att_mh = QKVAttention(
-            n_embd=n_embd,
-            n_heads=n_heads,
-            block_size=block_size,
-            dropout=dropout,
-            use_bias=use_bias,
-            causal=causal,
-        )
-        self.ffn_ln = nn.LayerNorm(n_embd, bias = use_bias)
-        self.mlp = nn.ModuleDict(dict(
-            ffn_fc1 = nn.Linear(n_embd, 4*n_embd),
-            ffn_fc2 = nn.Linear(4*n_embd, n_embd),
-            act     = nn.GELU(),
-            dropout = nn.Dropout(0.1)
-        ))
-        m = self.mlp
-        self.mlpf = lambda x: m.dropout(m.ffn_fc2(m.act(m.ffn_fc1(x)))) # MLP forward
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features, bias=False)
 
     def forward(self, x):
-        x = x + self.att_mh(self.att_ln(x))
-        x = x + self.mlpf(self.ffn_ln(x))
+        return F.linear(x, self.weight.to(x.dtype))
+
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc   = CastedLinear(config.n_embd, 4 * config.n_embd)
+        self.c_proj = CastedLinear(4 * config.n_embd, config.n_embd)
+        self.c_proj.weight.data.zero_()
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2;
+        x = self.c_proj(x)
         return x
 
-# PicoGPT model
-class PicoGPT(nn.Module):
-    def __init__(
-        self,
-        vocab_size,
-        n_embd,
-        n_heads,
-        n_layer,
-        causal,
-        dropout=0.0,
-        use_bias=False,
-        block_size=1e5,
-        
-    ):
+class Rotary(torch.nn.Module):
+
+    def __init__(self, config, base=10000):
+        super().__init__()
+        self.register_buffer('inv_freq', (1 / base) ** (torch.arange(0, config.n_embd, 2) / config.n_embd))
+        self.seq_len_cached = None
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if seq_len != self.seq_len_cached:
+            t = torch.arange(seq_len, device=x.device)
+            freqs = torch.outer(t, self.inv_freq)
+            self.seq_len_cached = seq_len
+            self.cos_cached = freqs.cos()
+            self.sin_cached = freqs.sin()
+        cos, sin = self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
+        # apply_rotary_emb(x, cos, sin)
+        x1, x2 = x.chunk(2, dim=3)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x)
+
+# Define the QKVAttention class
+class QKVAttention(nn.Module):
+
+    def __init__(self, config):
         super().__init__()
 
-        assert vocab_size is not None
-        assert block_size is not None
-        
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(vocab_size, n_embd),
-            wpe = nn.Embedding(block_size, n_embd),
-            drop = nn.Dropout(dropout),
-            h = nn.ModuleList([TransformerBlock(n_embd, n_heads, block_size, dropout, use_bias, causal) for _ in range(n_layer)]),
-            ln_f = nn.LayerNorm(n_embd, bias=use_bias),
-        ))
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        assert config.n_embd % config.n_heads == 0
+        self.c_q = CastedLinear(config.n_embd, config.n_embd)
+        self.c_k = CastedLinear(config.n_embd, config.n_embd)
+        self.c_v = CastedLinear(config.n_embd, config.n_embd)
+        self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
+        self.rotary = Rotary(config)
+        self.c_proj = CastedLinear(config.n_embd, config.n_embd)
+        self.c_proj.weight.data.zero_()
 
-        self.transformer.wte.weight = self.lm_head.weight # Weight Tying paper
+        self.n_head = config.n_heads
+    
+    def forward(self, x, vi, block_mask):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
+        assert B == 1, "Must use batch size = 1 for FlexAttention"
+        q = self.c_q(x).view(B, T, self.n_head, -1)
+        k = self.c_k(x).view(B, T, self.n_head, -1)
+        v = self.c_v(x).view(B, T, self.n_head, -1)
+        v = self.lambdas[0] * v + self.lambdas[1] * vi.view_as(v)
+        q, k = norm(q), norm(k)
+        q, k = self.rotary(q), self.rotary(k)
+        y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, enable_gqa=True)
+        y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
+        y = self.c_proj(y)
+        return y
 
-        # init all weights
-        self.apply(self._init_weights)
+# Define the TransformerBlock class
+class TransformerBlock(nn.Module):
+    
+    def __init__(self, config):
+        super().__init__()
+        self.attn = QKVAttention(config)
+        self.mlp = MLP(config)
+        self.lambdas = nn.Parameter(torch.tensor([1., 0.]))
 
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * n_layer))
+    def forward(self, x, vi, x0, block_mask):
+        x = self.lambdas[0] * x + self.lambdas[1] * x0
+        x = x + self.attn(norm(x), vi, block_mask)
+        x = x + self.mlp(norm(x))
+        return x
+    
+class ValueEmbedding(nn.Module):
+    def __init__(self, config: "GPTConfig"):
+        super().__init__()
+        self.embed = nn.ModuleList([
+            nn.Embedding(config.vocab_size, config.n_embd)
+            for _ in range(6)
+        ])
+
+    def forward(self, inputs) -> "list[torch.Tensor]":
+        ve = [emb(inputs) for emb in self.embed]
+        ve += reversed(ve)
+        return ve
+
+
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 61440 # Meltemi v1.5 vocab_size of 61366, padded up to nearest multiple of 64 for efficiency
+    n_layer: int = 3
+    n_heads: int = 4
+    n_embd: int = 128
+    dropout: float = 0.0
+    use_bias: bool = True
+
+
+# Define the PicoGPT model
+class MicroGPT(nn.Module):
+
+    def __init__(self,config):
+        super().__init__()
+
+        assert config.vocab_size is not None
+        self.config = config
+
+        # U-net design by @brendanh0gan
+        self.num_encoder_layers = config.n_layer // 2 # Half of the layers for encoder
+        self.num_decoder_layers = config.n_layer - self.num_encoder_layers # Remaining for decoder
+        # Add learnable skip connection weights for decoder layers
+        self.skip_weights = nn.Parameter(torch.ones(self.num_decoder_layers))
+
+        self.embed = nn.Embedding(config.vocab_size, config.n_embd)
+        self.blocks = nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)])
+        # token value embeddings
+        # U-net structure on token value embeddings
+        self.value_embeds = ValueEmbedding(config)
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size)
+        self.lm_head.weight.data.zero_()
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
     
@@ -126,45 +156,97 @@ class PicoGPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.ones_(module.weight)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
 
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        sliding_window_num_blocks: Optional[torch.Tensor] =1,
+    ):
+        BLOCK_SIZE = 128
+        seq_len = len(inputs)
+        assert seq_len % BLOCK_SIZE == 0
+        total_num_blocks = seq_len // BLOCK_SIZE
+        assert inputs.ndim == 1
+        docs = (inputs == 2).cumsum(0)
+        docs_low = docs.view(-1, BLOCK_SIZE)[:, 0].contiguous()
+        docs_high = docs.view(-1, BLOCK_SIZE)[:, -1].contiguous()
 
-    def forward(self, input):
-        device = input.device
-        b, t = input.size()
-        assert t <= self.transformer.wpe.weight.size(0), f"Cannot forward sequence of length {t}, block size is only {self.transformer.wpe.weight.size(0)}"
+        def document_causal(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            document_mask = docs[q_idx] == docs[kv_idx]
+            return causal_mask & document_mask
 
-        tok_emb = self.transformer.wte(input)
-        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0)
-        pos_emb = self.transformer.wpe(pos)
+        def dense_to_ordered(dense_mask: torch.Tensor):
+            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
+            indices = dense_mask.argsort(dim=-1, descending=True, stable=True).to(torch.int32)
+            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
-        x = self.lm_head(x)
+        def create_doc_swc_block_mask(sliding_window_num_blocks: torch.Tensor):
+            kv_idx = block_idx = torch.arange(total_num_blocks, dtype=torch.int32, device="cuda")
+            q_idx = block_idx[:, None]
+            causal_bm = q_idx >= kv_idx
+            causal_full_bm = q_idx > kv_idx
+            window_bm = q_idx - kv_idx < sliding_window_num_blocks
+            window_full_bm = window_bm
+            # document_bm = (docs_low[q_idx] <= docs_high[kv_idx]) & (docs_low[kv_idx] <= docs_high[q_idx])
+            document_bm = (docs_low[:, None] <= docs_high) & (docs_low <= docs_high[:, None])
+            document_full_bm = (docs_low[:, None] == docs_high) & (docs_low == docs_high[:, None])
+            nonzero_bm = causal_bm & window_bm & document_bm
+            full_bm  = causal_full_bm & window_full_bm & document_full_bm
+            kv_num_blocks, kv_indices = dense_to_ordered(nonzero_bm ^ full_bm)
+            full_kv_num_blocks, full_kv_indices = dense_to_ordered(full_bm)
+            return BlockMask.from_kv_blocks(
+                kv_num_blocks,
+                kv_indices,
+                full_kv_num_blocks,
+                full_kv_indices,
+                BLOCK_SIZE=BLOCK_SIZE,
+                mask_mod=document_causal,
+            )
 
-        return x
+        block_mask = create_doc_swc_block_mask(sliding_window_num_blocks)
 
-    def cross_entropy(self, input):
-        x = self(input)
-        return F.cross_entropy(x.transpose(1, 2), input)
+        # forward the GPT model itself
+        x = self.embed(inputs[None]) # token embeddings of shape (b, t, model_dim)
+        x = norm(x)
+        x0 = x
+        ve = self.value_embeds(inputs)
+        ve_enc, ve_dec = ve[:self.num_encoder_layers], ve[self.num_encoder_layers:]
+
+        # Store outputs for U-Net skip connections
+        skip_connections = []
+        # Encoder pass - process only the first half of the blocks
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, ve_enc[i], x0, block_mask)
+            skip_connections.append(x)
+        # Decoder pass - process the remaining blocks with weighted skip connections
+        for i in range(self.num_decoder_layers):
+            x = x + self.skip_weights[i] * skip_connections.pop()
+            # U-net structure on token value embeddings by @leloykun
+            x = self.blocks[self.num_encoder_layers + i](x, ve_dec[i], x0, block_mask)
+
+        x = norm(x)
+        if targets is not None:
+            logits = self.lm_head(x)
+            logits = 30 * torch.tanh(logits / 30)
+            logits = logits.float()
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            logits = 30 * torch.tanh(logits / 30)
+            logits = logits.float()
+            loss = None
+        return logits, loss
+
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # Any parameters that is 2D will be weight decayed, otherwise no.
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -183,3 +265,30 @@ class PicoGPT(nn.Module):
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
+    
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
